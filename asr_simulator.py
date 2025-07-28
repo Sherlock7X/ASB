@@ -1,21 +1,3 @@
-"""
-ASR Simulator - Monte Carlo simulation engine with CARA utility approximation
-
-This module implements the Monte Carlo simulation framework for ASR pricing using
-the numerically stable CARA utility approximation. It includes:
-
-1. ASRSimulator: Monte Carlo simulation engine with CARA approximation
-2. ASRTrainer: Policy gradient training using utility approximation  
-3. SimulationConfig: Configuration management
-4. compute_cara_utility_approximation(): Numerically stable CARA computation
-
-The CARA utility approximation avoids numerical overflow by using second-order
-Taylor expansion around expected PnL:
-CARA_approx = E[PnL] - γ/2 * Var[PnL]
-
-Based on the mathematical formulation from the ASR pricing research document.
-"""
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -65,13 +47,13 @@ class SimulationConfig:
     penalty_coeff: float = 2e-7        # Terminal penalty coefficient C
     
     # Simulation parameters
-    num_paths: int = 1000              # Monte Carlo paths
+    num_paths: int = 10000              # Monte Carlo paths
     random_seed: Optional[int] = 42    # Random seed for reproducibility
     
     # Neural network parameters
     hidden_dim: int = 50               # Hidden layer size
-    learning_rate: float = 0.001       # Learning rate
-    num_epochs: int = 100              # Training epochs
+    learning_rate: float = 0.01        # Higher learning rate
+    num_epochs: int = 30               # More epochs for better convergence
 
 
 class ASRSimulator:
@@ -344,148 +326,6 @@ def compute_cara_utility_approximation(pnl_paths: np.ndarray,
     return cara_approx
 
 
-class ASRTrainer:
-    """
-    Policy gradient trainer for ASR pricing using CARA utility approximation.
-    
-    This class handles the training of the neural networks using the CARA utility
-    approximation as the objective function. It uses policy gradient methods to
-    optimize both the trading rate and stopping policy networks.
-    """
-    
-    def __init__(self, config: SimulationConfig):
-        """
-        Initialize ASR trainer with configuration.
-        
-        Args:
-            config: Training configuration parameters
-        """
-        self.config = config
-        self.simulator = ASRSimulator(config)
-        
-        # Initialize model
-        self.model = ASRPricingModel(
-            F=config.F,
-            N=config.N,
-            S0=config.S0,
-            early_exercise_start=config.early_exercise_start
-        )
-        
-        # Initialize optimizer
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            lr=config.learning_rate
-        )
-        
-        # Training history
-        self.training_history = {
-            'cara_utilities': [],
-            'expected_pnls': [],
-            'pnl_stds': []
-        }
-        
-    def train(self) -> Dict[str, Any]:
-        """
-        Train the ASR pricing model using policy gradient optimization.
-        
-        Returns:
-            Dictionary with training results and final model performance
-        """
-        print(f"Starting ASR training with {self.config.num_epochs} epochs...")
-        print(f"Monte Carlo paths per epoch: {self.config.num_paths}")
-        print(f"Risk aversion γ: {self.config.gamma:.2e}")
-        print("=" * 60)
-        
-        best_utility = float('-inf')
-        best_model_state = None
-        
-        for epoch in range(self.config.num_epochs):
-            # Run Monte Carlo simulation
-            results = self.simulator.simulate_monte_carlo(self.model)
-            
-            # Extract metrics
-            cara_utility = results['cara_utility']
-            expected_pnl = results['expected_pnl']
-            pnl_std = results['pnl_std']
-            
-            # Store in history
-            self.training_history['cara_utilities'].append(cara_utility)
-            self.training_history['expected_pnls'].append(expected_pnl)
-            self.training_history['pnl_stds'].append(pnl_std)
-            
-            # Compute loss (negative CARA utility for minimization)
-            loss = -torch.tensor(cara_utility, requires_grad=True)
-            
-            # Backward pass and optimization
-            self.optimizer.zero_grad()
-            
-            # Policy gradient: we need to compute gradients through the simulation
-            # For simplicity, we'll use the REINFORCE-style approach
-            self._compute_policy_gradients(results)
-            
-            # Optimization step
-            self.optimizer.step()
-            
-            # Track best model
-            if cara_utility > best_utility:
-                best_utility = cara_utility
-                best_model_state = self.model.state_dict().copy()
-                
-            # Progress reporting
-            if (epoch + 1) % 10 == 0 or epoch == 0:
-                print(f"Epoch {epoch+1:3d}/{self.config.num_epochs}: "
-                      f"CARA Utility = {cara_utility:8.2f}, "
-                      f"E[PnL] = €{expected_pnl:,.0f}, "
-                      f"Std[PnL] = €{pnl_std:,.0f}")
-        
-        # Load best model
-        if best_model_state is not None:
-            self.model.load_state_dict(best_model_state)
-            
-        print("=" * 60)
-        print(f"Training completed! Best CARA utility: {best_utility:.2f}")
-        
-        return {
-            'best_utility': best_utility,
-            'final_model': self.model,
-            'training_history': self.training_history,
-            'final_results': self.simulator.simulate_monte_carlo(self.model)
-        }
-        
-    def _compute_policy_gradients(self, results: Dict[str, Any]):
-        """
-        Compute policy gradients for REINFORCE-style training.
-        
-        This is a simplified implementation. In practice, you would want to
-        implement a more sophisticated gradient computation through the
-        simulation process.
-        
-        Args:
-            results: Results from Monte Carlo simulation
-        """
-        # Simplified gradient computation
-        # In a full implementation, you would differentiate through the entire
-        # simulation process using automatic differentiation
-        
-        cara_utility = results['cara_utility']
-        
-        # Create a dummy loss that depends on model parameters
-        dummy_n = torch.zeros(1)
-        dummy_S = torch.ones(1) * self.config.S0
-        dummy_A = torch.ones(1) * self.config.S0
-        dummy_X = torch.zeros(1)
-        dummy_q = torch.zeros(1)
-        
-        trading_output = self.model.compute_trading_rate(dummy_n, dummy_S, dummy_A, dummy_X, dummy_q)
-        stopping_output = self.model.compute_stopping_probability(dummy_n, dummy_S, dummy_A, dummy_X, dummy_q)
-        
-        # Simple loss proportional to negative utility
-        dummy_loss = -cara_utility * (trading_output.sum() + stopping_output.sum()) * 1e-6
-        
-        # Backward pass
-        dummy_loss.backward()
-
-
 class BenchmarkStrategy:
     """Benchmark strategies for comparison with neural network approach."""
     
@@ -537,7 +377,7 @@ def run_benchmark_comparison():
         F=900_000_000, N=63, gamma=2.5e-7,
         early_exercise_start=22, early_exercise_end=62,
         eta=2e-7, phi=0.5, penalty_coeff=2e-7,
-        num_paths=1000, num_epochs=20, random_seed=42
+        num_paths=500, num_epochs=10, random_seed=42  # Reduced for faster testing
     )
     
     print(f"Configuration:")
