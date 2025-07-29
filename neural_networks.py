@@ -86,7 +86,7 @@ class ASRPricingModel(nn.Module):
                  F: float,
                  N: int, 
                  S0: float = 100.0,
-                 nu_phi: float = 1.0,
+                 nu_phi: float = 12.0,
                  early_exercise_start: int = 22):
         """
         Initialize ASR pricing model.
@@ -147,21 +147,13 @@ class ASRPricingModel(nn.Module):
         nn_inputs = torch.stack([input1, input2, input3, input4], dim=-1)
         
         # Get network output with constraint
-        v_tilde_raw = self.trading_network(nn_inputs).squeeze(-1)
-        v_tilde = torch.tanh(v_tilde_raw) * 0.5  # Limit adjustment to [-0.5, 0.5]
+        v_tilde = self.trading_network(nn_inputs).squeeze(-1)
         
         # Compute final trading rate
         naive_rate = (self.F / A) * ((n + 1) / self.N)
         adjustment = 1 + v_tilde
         
-        # Ensure adjustment stays positive and reasonable
-        adjustment = torch.clamp(adjustment, min=0.1, max=2.0)
-        
         v = naive_rate * adjustment - q
-        
-        # Additional constraint: limit extreme trading rates
-        max_rate = self.F / A / 10  # No more than 10% of target per day
-        v = torch.clamp(v, min=-max_rate, max=max_rate)
         
         return v
     
@@ -177,10 +169,10 @@ class ASRPricingModel(nn.Module):
         With improved initialization to prefer later exercise.
         """
         # Check if we're at final time step
-        is_final = (n >= self.N - 1).float()
+        is_final = (n >= self.N).float()
         
         # Check if we're in the early exercise window (days 22-62 from realistic example)
-        is_exercise_period = ((n >= self.early_exercise_start) & (n < self.N - 1)).float()
+        is_exercise_period = ((n >= self.early_exercise_start) & (n < self.N)).float()
         
         if torch.any(is_exercise_period):
             # Prepare inputs for stopping network  
@@ -191,17 +183,12 @@ class ASRPricingModel(nn.Module):
             nn_inputs = torch.stack([input1, input2, input3], dim=-1)
             
             # Get network output
-            p_tilde_raw = self.stopping_network(nn_inputs).squeeze(-1)
-            p_tilde = torch.tanh(p_tilde_raw)  # Output in [-1, 1]
+            p_tilde = self.stopping_network(nn_inputs).squeeze(-1)
             
             # Compute stopping probability with bias toward later exercise
-            frontier_term = q * A / self.F - p_tilde
-            
-            # Add bias to prefer later stopping (benchmark behavior)
-            time_bias = (n / self.N - 0.8)  # Bias toward stopping near end
-            biased_frontier = frontier_term + time_bias
-            
-            sigmoid_input = self.nu_phi * biased_frontier
+            temp = q * A / self.F - p_tilde - 0.95
+
+            sigmoid_input = self.nu_phi * temp
             stopping_prob = self.modified_sigmoid(sigmoid_input)
             
             # Apply indicator functions: can only stop in exercise period or at final time
@@ -332,40 +319,4 @@ if __name__ == "__main__":
     # Forward pass
     v, p, pnl = model(state_batch)
     
-    print(f"Neural Network Outputs:")
-    print(f"  - Trading rates shape: {v.shape}")
-    print(f"  - Stopping probabilities shape: {p.shape}")  
-    print(f"  - P&L shape: {pnl.shape}")
     print()
-    
-    # Show sample results
-    print(f"Sample Results (first 5 paths):")
-    for i in range(min(5, batch_size)):
-        print(f"  Path {i+1}:")
-        print(f"    Day: {n[i].item():.0f}, Stock: €{S[i].item():.2f}, Avg: €{A[i].item():.2f}")
-        print(f"    Trading rate: {v[i].item():,.0f} shares/day")
-        print(f"    Stopping prob: {p[i].item():.1%}")
-        print(f"    P&L if stop: €{pnl[i].item():,.0f}")
-        print()
-    
-    # Test specific network components
-    print(f"Component Tests:")
-    
-    # Test Modified Sigmoid with various inputs
-    sigmoid = model.modified_sigmoid
-    test_inputs = torch.tensor([-5.0, -1.0, 0.0, 1.0, 5.0])
-    sigmoid_outputs = sigmoid(test_inputs)
-    print(f"  Modified Sigmoid test:")
-    for i, (inp, out) in enumerate(zip(test_inputs, sigmoid_outputs)):
-        print(f"    S({inp:.1f}) = {out.item():.3f}")
-    print()
-    
-    # Test terminal penalty function
-    remaining_shares = torch.tensor([1000.0, 5000.0, 10000.0, 50000.0])
-    penalties = model.execution_cost(remaining_shares)
-    print(f"  Terminal Penalty ℓ(q) = Cq² with C = 2×10⁻⁷:")
-    for shares, penalty in zip(remaining_shares, penalties):
-        print(f"    {shares.item():,.0f} shares → €{penalty.item():,.2f}")
-    
-    print(f"\nTest completed successfully!")
-    print(f"All parameters match the realistic ASR contract configuration.")

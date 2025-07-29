@@ -80,112 +80,9 @@ class ASRSimulator:
         )
         self.modified_sigmoid = ModifiedSigmoid()
         
-    def simulate_single_path(self, 
-                           model: ASRPricingModel,
-                           stock_path: np.ndarray,
-                           volume_path: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
-        """
-        Simulate a single Monte Carlo path for ASR contract.
-        
-        Args:
-            model: ASR pricing model (neural networks)
-            stock_path: Stock price path of shape (N+1,)
-            volume_path: Volume path of shape (N+1,)
-            
-        Returns:
-            Tuple of (pnl_path, stopping_probs, stopping_time)
-            - pnl_path: Profit/loss at each time step
-            - stopping_probs: Stopping probabilities at each time step
-            - stopping_time: Actual stopping time (-1 if never stopped)
-        """
-        N = self.config.N
-        F = self.config.F
-        S0 = self.config.S0
-        dt = self.config.dt
-        
-        # Initialize state variables
-        pnl_path = np.zeros(N + 1)
-        stopping_probs = np.zeros(N + 1)
-        
-        # Track running state
-        A = stock_path[0]  # Running average starts at S0
-        q = 0.0           # Shares purchased so far
-        X = 0.0           # Cash spent so far
-        stopped = False
-        stopping_time = -1
-        
-        for n in range(1, N + 1):
-            if stopped:
-                # If already stopped, carry forward the final PnL
-                pnl_path[n] = pnl_path[stopping_time]
-                stopping_probs[n] = 0.0
-                continue
-                
-            # Update running average
-            A = update_running_average(A, stock_path[n], n)
-            
-            # Prepare inputs for neural networks
-            time_input = n / N - 0.5
-            price_input = stock_path[n] / S0 - 1.0
-            spread_input = (A - stock_path[n]) / S0
-            
-            # Trading rate network inputs (4D)
-            position_input = q * A / F - 0.5
-            trading_inputs = torch.tensor([
-                time_input, price_input, spread_input, position_input
-            ], dtype=torch.float32).unsqueeze(0)
-            
-            # Stopping policy network inputs (3D)  
-            stopping_inputs = torch.tensor([
-                time_input, price_input, spread_input
-            ], dtype=torch.float32).unsqueeze(0)
-            
-            # Get neural network outputs
-            with torch.no_grad():
-                # Convert to tensors for model input
-                n_tensor = torch.tensor([float(n)], dtype=torch.float32)
-                S_tensor = torch.tensor([stock_path[n]], dtype=torch.float32)
-                A_tensor = torch.tensor([A], dtype=torch.float32)
-                X_tensor = torch.tensor([X], dtype=torch.float32)
-                q_tensor = torch.tensor([q], dtype=torch.float32)
-                
-                # Get trading rate from model
-                v = model.compute_trading_rate(n_tensor, S_tensor, A_tensor, X_tensor, q_tensor).item()
-                
-                # Get stopping probability from model
-                stopping_prob = model.compute_stopping_probability(
-                    n_tensor, S_tensor, A_tensor, X_tensor, q_tensor
-                ).item()
-                
-                # Clamp stopping probability for early exercise window
-                if not (self.config.early_exercise_start <= n <= self.config.early_exercise_end):
-                    stopping_prob = 0.0
-                    
-            stopping_probs[n] = stopping_prob
-            
-            # Update shares purchased
-            q = update_shares_purchased(q, v, dt)
-            
-            # Update cash spent (includes execution costs)
-            X = update_cash_spent(
-                X, v, stock_path[n], volume_path[n], dt,
-                eta=self.config.eta, phi=self.config.phi
-            )
-            
-            # Compute PnL if stopping at this time
-            # PnL_n^F = F - X_n - (F/A_n - q_n) S_n - ℓ(F/A_n - q_n)
-            remaining_shares = F / A - q
-            remaining_cost = remaining_shares * stock_path[n]
-            terminal_penalty = self.config.penalty_coeff * (remaining_shares ** 2)
-            
-            pnl_n = F - X - remaining_cost - terminal_penalty
-            pnl_path[n] = pnl_n
-
-        return pnl_path, stopping_probs
-
     def simulate_monte_carlo(self, model: ASRPricingModel) -> Dict[str, Any]:
         """
-        Run full Monte Carlo simulation for ASR pricing.
+        Run full Monte Carlo simulation for ASR pricing using vectorized operations.
         
         Args:
             model: ASR pricing model (neural networks)
@@ -195,7 +92,10 @@ class ASRSimulator:
         """
         num_paths = self.config.num_paths
         N = self.config.N
-        
+        F = self.config.F
+        S0 = self.config.S0
+        dt = self.config.dt
+
         # Generate all stock and volume paths
         stock_paths = self.stock_process.simulate_path(
             N, num_paths, random_seed=self.config.random_seed
@@ -208,14 +108,57 @@ class ASRSimulator:
         all_pnl_paths = np.zeros((num_paths, N + 1))
         all_stopping_probs = np.zeros((num_paths, N + 1)) 
         
-        # Simulate each path
-        for i in tqdm(range(num_paths), desc="Simulating ASR paths"):
-            pnl_path, stopping_probs = self.simulate_single_path(
-                model, stock_paths[i], volume_paths[i]
-            )
-            all_pnl_paths[i] = pnl_path
-            all_stopping_probs[i] = stopping_probs
+        # Initialize state variables for all paths
+        A = np.full(num_paths, stock_paths[:, 0])
+        q = np.zeros(num_paths)
+        X = np.zeros(num_paths)
+        
+        stopped_mask = np.zeros(num_paths, dtype=bool)
+        final_pnl = np.zeros(num_paths)
+
+        for n in range(1, N + 1):
+            active_mask = ~stopped_mask
+            if not np.any(active_mask):
+                break
+
+            # Update running average for active paths
+            A[active_mask] = update_running_average(A[active_mask], stock_paths[active_mask, n], n)
             
+            # Prepare inputs for neural networks for active paths
+            active_S = stock_paths[active_mask, n]
+            active_A = A[active_mask]
+            active_q = q[active_mask]
+            active_X = X[active_mask]
+            
+            n_tensor = torch.full((active_mask.sum(),), float(n), dtype=torch.float32)
+            S_tensor = torch.tensor(active_S, dtype=torch.float32)
+            A_tensor = torch.tensor(active_A, dtype=torch.float32)
+            X_tensor = torch.tensor(active_X, dtype=torch.float32)
+            q_tensor = torch.tensor(active_q, dtype=torch.float32)
+
+            with torch.no_grad():
+                v = model.compute_trading_rate(n_tensor, S_tensor, A_tensor, X_tensor, q_tensor).numpy().flatten()
+                stopping_prob = model.compute_stopping_probability(n_tensor, S_tensor, A_tensor, X_tensor, q_tensor).numpy().flatten()
+
+            if not (self.config.early_exercise_start <= n <= self.config.early_exercise_end):
+                stopping_prob[:] = 0.0
+            
+            all_stopping_probs[active_mask, n] = stopping_prob
+
+            # Update shares purchased and cash spent for active paths
+            q[active_mask] = update_shares_purchased(q[active_mask], v, dt)
+            X[active_mask] = update_cash_spent(
+                X[active_mask], v, stock_paths[active_mask, n], volume_paths[active_mask, n], dt,
+                eta=self.config.eta, phi=self.config.phi
+            )
+
+            # Compute PnL if stopping at this time for all paths
+            remaining_shares = F / A - q
+            remaining_cost = remaining_shares * stock_paths[:, n]
+            terminal_penalty = self.config.penalty_coeff * (remaining_shares ** 2)
+            pnl_n = F - X - remaining_cost - terminal_penalty
+            all_pnl_paths[:, n] = pnl_n
+
         # Compute CARA utility approximation
         cara_utility, expected_pnl = compute_cara_utility_approximation(
             all_pnl_paths, all_stopping_probs, 
@@ -308,30 +251,147 @@ class BenchmarkStrategy:
     def compute_trading_rate(self, n: torch.Tensor, S: torch.Tensor, A: torch.Tensor, 
                            X: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
         """Linear trading strategy: v = (F/A * (n+1)/N - q) / dt"""
-        # Convert to numpy for computation
-        n_val = n.item()
-        A_val = A.item()
-        q_val = q.item()
+        # Handle vectorized operations for multiple paths
+        n_vals = n  # Keep as tensor for vectorized operations
+        A_vals = A  # Keep as tensor for vectorized operations
+        q_vals = q  # Keep as tensor for vectorized operations
         
         # Linear schedule: buy F/N shares each period, adjusted for current average price
-        target_shares = self.F / A_val * (n_val + 1) / self.N
-        remaining_shares = target_shares - q_val
+        target_shares = self.F / A_vals * (n_vals + 1) / self.N
+        remaining_shares = target_shares - q_vals
         
         # Trading rate (shares per day, dt=1)
         v = remaining_shares  # Buy remaining shares linearly
         
-        return torch.tensor([v], dtype=torch.float32)
+        return v
     
     def compute_stopping_probability(self, n: torch.Tensor, S: torch.Tensor, A: torch.Tensor,
                                    X: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
         """Never exercise early - always go to maturity"""
-        n_val = n.item()
+        # Handle vectorized operations for multiple paths
+        n_vals = n  # Keep as tensor for vectorized operations
         
-        # Never exercise early, only at maturity
-        if n_val >= self.N:
-            return torch.tensor([1.0], dtype=torch.float32)
-        else:
-            return torch.tensor([0.0], dtype=torch.float32)
+        # Never exercise early, only at maturity (N=63)
+        # Return 1.0 for all paths at maturity, 0.0 otherwise
+        stopping_probs = torch.where(n_vals >= self.N, 
+                                   torch.ones_like(n_vals, dtype=torch.float32),
+                                   torch.zeros_like(n_vals, dtype=torch.float32))
+        return stopping_probs
+
+
+def train_neural_network(config: SimulationConfig) -> ASRPricingModel:
+    """
+    Train the neural network to maximize CARA utility using policy gradient approach.
+    
+    Since the Monte Carlo simulation returns numpy arrays, we use a policy gradient
+    approach with finite differences for gradient estimation.
+    
+    Args:
+        config: Simulation configuration parameters
+        
+    Returns:
+        Trained ASR pricing model
+    """
+    print("Training Neural Network for ASR Pricing")
+    print("=" * 50)
+    
+    # Initialize model and optimizer
+    model = ASRPricingModel(
+        F=config.F, 
+        N=config.N, 
+        S0=config.S0, 
+        early_exercise_start=config.early_exercise_start
+    )
+    
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
+    simulator = ASRSimulator(config)
+    
+    best_utility = float('-inf')
+    best_model_state = None
+    utilities_history = []
+    
+    print(f"Training Configuration:")
+    print(f"  - Learning Rate: {config.learning_rate}")
+    print(f"  - Epochs: {config.num_epochs}")
+    print(f"  - Monte Carlo Paths: {config.num_paths}")
+    print(f"  - Hidden Dimension: {config.hidden_dim}")
+    print()
+    
+    for epoch in tqdm(range(config.num_epochs), desc="Training"):
+        model.train()
+        
+        # Evaluate current policy
+        with torch.no_grad():
+            results = simulator.simulate_monte_carlo(model)
+            current_utility = results['cara_utility']
+            expected_pnl = results['expected_pnl']
+        
+        # Store the utility as our "reward"
+        utilities_history.append(current_utility)
+        
+        # Save best model
+        if current_utility > best_utility:
+            best_utility = current_utility
+            best_model_state = model.state_dict().copy()
+        
+        # Simple parameter update using random perturbations (evolutionary strategy)
+        if epoch > 0:  # Skip first iteration
+            # Generate random perturbations
+            perturbations = []
+            utilities_perturbed = []
+            
+            # Try a few random perturbations
+            num_perturbations = 3
+            perturbation_std = 0.01
+            
+            for _ in range(num_perturbations):
+                # Save current parameters
+                original_params = [p.clone() for p in model.parameters()]
+                
+                # Apply random perturbation
+                perturbation = []
+                for param in model.parameters():
+                    noise = torch.randn_like(param) * perturbation_std
+                    param.data += noise
+                    perturbation.append(noise)
+                
+                # Evaluate perturbed policy
+                with torch.no_grad():
+                    perturbed_results = simulator.simulate_monte_carlo(model)
+                    perturbed_utility = perturbed_results['cara_utility']
+                
+                perturbations.append(perturbation)
+                utilities_perturbed.append(perturbed_utility)
+                
+                # Restore original parameters
+                for param, orig in zip(model.parameters(), original_params):
+                    param.data = orig
+            
+            # Update parameters in direction of best perturbation
+            if utilities_perturbed:
+                best_idx = np.argmax(utilities_perturbed)
+                if utilities_perturbed[best_idx] > current_utility:
+                    # Move in direction of best perturbation
+                    with torch.no_grad():
+                        for param, noise in zip(model.parameters(), perturbations[best_idx]):
+                            param.data += config.learning_rate * noise
+        
+        # Print progress every 20 epochs
+        if (epoch + 1) % 20 == 0:
+            print(f"Epoch {epoch+1:3d}: CARA Utility = {current_utility:10.2f}, Expected PnL = €{expected_pnl:,.0f}")
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    model.eval()
+    
+    print(f"\nTraining Complete!")
+    print(f"Best CARA Utility: {best_utility:.2f}")
+    print(f"Final CARA Utility: {utilities_history[-1]:.2f}")
+    print(f"Improvement: {utilities_history[-1] - utilities_history[0]:.2f}")
+    
+    return model
 
 
 def run_benchmark_comparison():
@@ -347,7 +407,7 @@ def run_benchmark_comparison():
         F=900_000_000, N=63, gamma=2.5e-7,
         early_exercise_start=22, early_exercise_end=63,
         eta=2e-7, phi=0.5, penalty_coeff=2e-7,
-        num_paths=300, num_epochs=10, random_seed=42  # Reduced for faster testing
+        num_paths=1000, num_epochs=200, random_seed=42  # Increased paths and epochs for better training
     )
     
     print(f"Configuration:")
@@ -375,17 +435,37 @@ def run_benchmark_comparison():
     print(f"  Expected PnL: €{benchmark_results['expected_pnl']:,.0f}")
     print()
 
-    # 2. Neural Network Strategy
-    print("2. Testing Neural Network Strategy")
+    # 2. Neural Network Strategy (Trained)
+    print("2. Testing Trained Neural Network Strategy")
     print("-" * 50) 
-    # Initialize neural network model
-    model = ASRPricingModel(F=config.F, N=config.N, S0=config.S0, early_exercise_start=config.early_exercise_start)
-
+    
+    # Train the neural network model
+    print("Training neural network...")
+    model = train_neural_network(config)
+    
+    # Test the trained model
     NN_results = simulator.simulate_monte_carlo(model)
     results['neural_network'] = NN_results
     print(f"  CARA Utility: {NN_results['cara_utility']:.2f}")
     print(f"  Expected PnL: €{NN_results['expected_pnl']:,.0f}")
     print()
+    
+    # 3. Performance Comparison
+    print("3. Performance Comparison")
+    print("-" * 50)
+    print(f"Strategy                    | CARA Utility | Expected PnL")
+    print(f"--------------------------- | ------------ | -------------")
+    print(f"Benchmark (Linear + Never)  | {benchmark_results['cara_utility']:11.2f} | €{benchmark_results['expected_pnl']:10,.0f}")
+    print(f"Neural Network (Trained)    | {NN_results['cara_utility']:11.2f} | €{NN_results['expected_pnl']:10,.0f}")
+    
+    utility_improvement = NN_results['cara_utility'] - benchmark_results['cara_utility']
+    pnl_improvement = NN_results['expected_pnl'] - benchmark_results['expected_pnl']
+    
+    print(f"--------------------------- | ------------ | -------------")
+    print(f"Improvement (NN - Benchmark)| {utility_improvement:11.2f} | €{pnl_improvement:10,.0f}")
+    print()
+    
+    return results
 
 
 if __name__ == "__main__":

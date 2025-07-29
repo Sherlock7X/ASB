@@ -124,34 +124,47 @@ def update_shares_purchased(q_prev: float, v: float, dt: float) -> float:
     return q_prev + v * dt
 
 
-def execution_cost_function(rho: float, eta: float = 2e-7, phi: float = 0.5) -> float:
+def execution_cost_function(rho, eta: float = 2e-7, phi: float = 0.5):
     """
     Execution cost function L(ρ) = η|ρ|^(1+φ)
     
+    Supports both scalar and vectorized operations.
+    
     Args:
-        rho: Participation rate (v/V)
+        rho: Participation rate (v/V) - can be scalar or array
         eta: Cost parameter (default 2×10⁻⁷ from realistic example)
         phi: Cost exponent (default 0.5 from realistic example)
     """
-    return eta * (abs(rho) ** (1 + phi))
+    import numpy as np
+    return eta * (np.abs(rho) ** (1 + phi))
 
 
-def update_cash_spent(X_prev: float, v: float, S_next: float, V_next: float, dt: float, 
-                     eta: float = 2e-7, phi: float = 0.5) -> float:
+def update_cash_spent(X_prev, v, S_next, V_next, dt: float, 
+                     eta: float = 2e-7, phi: float = 0.5):
     """
     Update cumulative cash spent.
     
     X_{n+1} = X_n + v_n * S_{n+1} * dt + L(v_n/V_{n+1}) * V_{n+1} * dt
     
+    Supports both scalar and vectorized operations.
+    
     Args:
         eta: Execution cost parameter (default 2×10⁻⁷ from realistic example)
         phi: Execution cost exponent (default 0.5 from realistic example)
     """
-    if V_next > 0:
-        rho = v / V_next  # Participation rate
-        execution_cost = execution_cost_function(rho, eta, phi) * V_next * dt
-    else:
-        execution_cost = 0
+    import numpy as np
+    
+    # Convert to numpy arrays to support both scalar and vector operations
+    X_prev = np.asarray(X_prev)
+    v = np.asarray(v)
+    S_next = np.asarray(S_next)
+    V_next = np.asarray(V_next)
+    
+    # Handle division by zero with vectorized operations
+    rho = np.where(V_next > 0, v / V_next, 0)  # Participation rate
+    execution_cost = np.where(V_next > 0, 
+                             execution_cost_function(rho, eta, phi) * V_next * dt,
+                             0)
         
     return X_prev + v * S_next * dt + execution_cost
 
