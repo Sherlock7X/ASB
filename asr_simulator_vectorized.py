@@ -2,6 +2,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import os
+from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 from dataclasses import dataclass
 from tqdm import tqdm
@@ -54,6 +56,7 @@ class SimulationConfig:
     hidden_dim: int = 50               # Hidden layer size
     learning_rate: float = 0.01        # Higher learning rate
     num_epochs: int = 30               # More epochs for better convergence
+    load_model: bool = False            # Load existing model if True
 
 
 class ASRSimulator:
@@ -95,7 +98,7 @@ class ASRSimulator:
         F = self.config.F
         S0 = self.config.S0
         dt = self.config.dt
-
+        
         # Generate all stock and volume paths
         stock_paths = self.stock_process.simulate_path(
             N, num_paths, random_seed=self.config.random_seed
@@ -255,10 +258,11 @@ class BenchmarkStrategy:
         n_vals = n  # Keep as tensor for vectorized operations
         A_vals = A  # Keep as tensor for vectorized operations
         q_vals = q  # Keep as tensor for vectorized operations
+        X_vals = X  # Keep as tensor for vectorized operations
         
         # Linear schedule: buy F/N shares each period, adjusted for current average price
-        target_shares = self.F / A_vals * (n_vals + 1) / self.N
-        remaining_shares = target_shares - q_vals
+        target_shares = self.F / A_vals * (n_vals) / self.N
+        remaining_shares = target_shares - q_vals  # Remaining shares to buy
         
         # Trading rate (shares per day, dt=1)
         v = remaining_shares  # Buy remaining shares linearly
@@ -302,7 +306,15 @@ def train_neural_network(config: SimulationConfig) -> ASRPricingModel:
         S0=config.S0, 
         early_exercise_start=config.early_exercise_start
     )
-    
+
+    if config.load_model:
+        model_file = Path("models/best_asr_model.pth")
+        if model_file.exists():
+            print(f"Loading existing model from {model_file}")
+            model.load_state_dict(torch.load(model_file, weights_only=False))
+        else:
+            print(f"Model file {model_file} not found. Proceeding with fresh model.")
+
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     simulator = ASRSimulator(config)
     
@@ -383,8 +395,20 @@ def train_neural_network(config: SimulationConfig) -> ASRPricingModel:
     # Load best model
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
-    
+
+    # Ensure model is in evaluation mode before saving
     model.eval()
+
+    # Save the best model with additional reproducibility information
+    model_save_path = Path("models")
+    model_save_path.mkdir(exist_ok=True)
+    model_file = model_save_path / "best_asr_model.pth"
+
+    if best_model_state is not None:
+        torch.save(best_model_state, model_file)
+        print(f"Best model saved to: {model_file}")
+    else:
+        print("No best model state to save.")
     
     print(f"\nTraining Complete!")
     print(f"Best CARA Utility: {best_utility:.2f}")
@@ -394,64 +418,98 @@ def train_neural_network(config: SimulationConfig) -> ASRPricingModel:
     return model
 
 
-def run_benchmark_comparison():
+def run_train():
     """
     Compare neural network strategy with benchmark strategies.
     """
     print("ASR Benchmark Comparison")
     print("=" * 60)
     
-    # Initialize configuration
-    config = SimulationConfig(
+    # Training configuration
+    train_config = SimulationConfig(
         S0=45.0, sigma=0.6, V0=4_000_000,
         F=900_000_000, N=63, gamma=2.5e-7,
         early_exercise_start=22, early_exercise_end=63,
         eta=2e-7, phi=0.5, penalty_coeff=2e-7,
-        num_paths=1000, num_epochs=200, random_seed=42  # Increased paths and epochs for better training
+        num_paths=500, num_epochs=500, random_seed=42,  # Training seed
+        load_model=True
     )
-    
-    print(f"Configuration:")
-    print(f"  Notional: €{config.F:,.0f}, Time Horizon: {config.N} days")
-    print(f"  Risk Aversion: γ = {config.gamma:.2e}")
-    print(f"  Monte Carlo Paths: {config.num_paths:,}")
+
+    # Train the neural network model
+    print("1. Training Neural Network Strategy")
+    print("-" * 50)
+    print("Training neural network...")
+    model = train_neural_network(train_config)
     print()
-    
-    simulator = ASRSimulator(config)
+
+def run_benchmark_comparison():
+
+    # Testing configuration - use same seed as training for fair comparison
+    test_config = SimulationConfig(
+        S0=45.0, sigma=0.6, V0=4_000_000,
+        F=900_000_000, N=63, gamma=2.5e-7,
+        early_exercise_start=22, early_exercise_end=63,
+        eta=2e-7, phi=0.5, penalty_coeff=2e-7,
+        num_paths=500, random_seed=22,  # Same seed for consistent comparison
+        load_model=False
+    )
+
+    # Initialize test simulator
+    test_simulator = ASRSimulator(test_config)
     results = {}
     
-    # 1. Benchmark: Linear Strategy + Never Early Exercise
-    print("1. Testing Benchmark: Linear Strategy + Never Early Exercise")
+    # Set global random seed for reproducibility
+    if test_config.random_seed is not None:
+        np.random.seed(test_config.random_seed)
+        torch.manual_seed(test_config.random_seed)
+    
+    # 2. Test Benchmark Strategy
+    print("2. Testing Benchmark: Linear Strategy + Never Early Exercise")
     print("-" * 50)
     
     benchmark_model = BenchmarkStrategy(
-        F=config.F, N=config.N, S0=config.S0,
-        early_exercise_start=config.early_exercise_start
+        F=test_config.F, N=test_config.N, S0=test_config.S0,
+        early_exercise_start=test_config.early_exercise_start
     )
     
-    benchmark_results = simulator.simulate_monte_carlo(benchmark_model)
+    # Reset random seed before benchmark evaluation
+    if test_config.random_seed is not None:
+        np.random.seed(test_config.random_seed)
+        torch.manual_seed(test_config.random_seed)
+    
+    benchmark_results = test_simulator.simulate_monte_carlo(benchmark_model)
     results['benchmark'] = benchmark_results
     
     print(f"  CARA Utility: {benchmark_results['cara_utility']:.2f}")
     print(f"  Expected PnL: €{benchmark_results['expected_pnl']:,.0f}")
     print()
 
-    # 2. Neural Network Strategy (Trained)
-    print("2. Testing Trained Neural Network Strategy")
-    print("-" * 50) 
+    # 3. Test Trained Neural Network Strategy
+    print("3. Testing Trained Neural Network Strategy")
+    print("-" * 50)
     
-    # Train the neural network model
-    print("Training neural network...")
-    model = train_neural_network(config)
-    
-    # Test the trained model
-    NN_results = simulator.simulate_monte_carlo(model)
+    model = ASRPricingModel(
+        F=test_config.F, 
+        N=test_config.N, 
+        S0=test_config.S0, 
+        early_exercise_start=test_config.early_exercise_start
+    )
+    model_file = Path("models/best_asr_model.pth")
+    if model_file.exists():
+        print(f"Loading trained model from {model_file}")
+        model.load_state_dict(torch.load(model_file, weights_only=False))
+
+    model.eval()  # Set model to evaluation mode
+
+    NN_results = test_simulator.simulate_monte_carlo(model)
     results['neural_network'] = NN_results
+    
     print(f"  CARA Utility: {NN_results['cara_utility']:.2f}")
     print(f"  Expected PnL: €{NN_results['expected_pnl']:,.0f}")
     print()
     
-    # 3. Performance Comparison
-    print("3. Performance Comparison")
+    # 4. Performance Comparison
+    print("4. Performance Comparison")
     print("-" * 50)
     print(f"Strategy                    | CARA Utility | Expected PnL")
     print(f"--------------------------- | ------------ | -------------")
@@ -469,4 +527,7 @@ def run_benchmark_comparison():
 
 
 if __name__ == "__main__":
+
+    # run_train()
+
     run_benchmark_comparison()

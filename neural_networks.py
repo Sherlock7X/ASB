@@ -150,7 +150,7 @@ class ASRPricingModel(nn.Module):
         v_tilde = self.trading_network(nn_inputs).squeeze(-1)
         
         # Compute final trading rate
-        naive_rate = (self.F / A) * ((n + 1) / self.N)
+        naive_rate = (self.F / A) * ((n) / self.N)
         adjustment = 1 + v_tilde
         
         v = naive_rate * adjustment - q
